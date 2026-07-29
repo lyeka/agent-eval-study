@@ -43,6 +43,7 @@ URL_PATTERN = re.compile(
 )
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 ENGLISH_WORD_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9'’+._^-]*")
+CODE_BLOCK_SENTINEL = "\x00FENCED_CODE_BLOCK\x00"
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class DocumentFacts:
     list_types: list[str]
     table_columns: list[int]
     blockquote_lines: int
+    structural_sequence: list[str]
     links: list[Link]
     bare_urls: list[str]
     untranslated_segments: list[dict[str, object]]
@@ -103,7 +105,7 @@ def _mask_fenced_code(text: str) -> tuple[str, list[CodeBlock], list[str]]:
                 opening_info = match.group(2).strip()
                 opening_line = line_number
                 body = []
-                masked_lines.append(_line_break(line))
+                masked_lines.append(CODE_BLOCK_SENTINEL + _line_break(line))
             else:
                 masked_lines.append(line)
             continue
@@ -230,6 +232,28 @@ def _count_table_columns(line: str) -> int:
     return len(re.split(r"(?<!\\)\|", logical))
 
 
+def _structural_sequence(masked: str) -> list[str]:
+    sequence: list[str] = []
+    for line in masked.splitlines():
+        if line == CODE_BLOCK_SENTINEL:
+            sequence.append("code-block")
+            continue
+        heading = HEADING_PATTERN.match(line)
+        if heading:
+            sequence.append(f"heading-{len(heading.group(1))}")
+            continue
+        if BLOCKQUOTE_PATTERN.match(line):
+            sequence.append("blockquote")
+            continue
+        listed = LIST_PATTERN.match(line)
+        if listed:
+            sequence.append("list-bullet" if listed.group("bullet") else "list-ordered")
+            continue
+        if TABLE_PATTERN.match(line):
+            sequence.append(f"table-{_count_table_columns(line)}")
+    return sequence
+
+
 def _is_external(destination: str) -> bool:
     lowered = destination.casefold()
     return lowered.startswith(("http://", "https://", "//", "mailto:", "data:"))
@@ -319,6 +343,7 @@ def _document_facts(text: str) -> DocumentFacts:
         list_types=list_types,
         table_columns=table_columns,
         blockquote_lines=blockquote_lines,
+        structural_sequence=_structural_sequence(masked),
         links=links,
         bare_urls=bare_urls,
         untranslated_segments=_untranslated_segments(masked),
@@ -327,7 +352,27 @@ def _document_facts(text: str) -> DocumentFacts:
 
 
 def _difference_message(name: str, source: object, target: object) -> str:
+    if isinstance(source, list) and isinstance(target, list):
+        common = min(len(source), len(target))
+        first_difference = next(
+            (index for index in range(common) if source[index] != target[index]),
+            common,
+        )
+        source_item = source[first_difference] if first_difference < len(source) else None
+        target_item = target[first_difference] if first_difference < len(target) else None
+        return (
+            f"{name} differs at index {first_difference}: "
+            f"source={_preview(source_item)}, target={_preview(target_item)}; "
+            f"counts source={len(source)}, target={len(target)}"
+        )
     return f"{name} differs: source={source!r}, target={target!r}"
+
+
+def _preview(value: object, limit: int = 220) -> str:
+    rendered = repr(value)
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[: limit - 3] + "..."
 
 
 def _validate_image_files(target: Path, links: Iterable[Link]) -> list[str]:
@@ -372,6 +417,11 @@ def validate(source: Path, target: Path) -> tuple[dict[str, object], list[str]]:
         ("List item type sequence", source_facts.list_types, target_facts.list_types),
         ("Table column sequence", source_facts.table_columns, target_facts.table_columns),
         ("Block quote line count", source_facts.blockquote_lines, target_facts.blockquote_lines),
+        (
+            "Structural element sequence",
+            source_facts.structural_sequence,
+            target_facts.structural_sequence,
+        ),
         ("Fenced code blocks", source_facts.code_blocks, target_facts.code_blocks),
         ("Inline code sequence", source_facts.inline_code, target_facts.inline_code),
         ("External URL sequence", source_facts.bare_urls, target_facts.bare_urls),

@@ -138,4 +138,3 @@ Never report the translation as complete when validation fails. If a source
 construct falls outside the validator's supported Markdown forms, inspect it
 manually and explain the limitation rather than weakening the content to make
 the check pass.
-
