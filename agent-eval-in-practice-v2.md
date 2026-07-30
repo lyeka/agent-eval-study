@@ -77,7 +77,7 @@ Grader 决定了一次 Trial 是否成功，选错 Grader 会直接影响结论�
 优点：快、便宜、确定性、结果可复现，调试也容易。
 缺点：对有效但格式不同的输出容易误判，比如 `96.12` 和 `96.124991` 都正确，但精确匹配只会接受其中一个。
 
-Anthropic 曾记录 Opus 4.5 在 CORE-Bench 上初始只得 42%，后来发现其中一个原因正是过于严格的数值匹配——修复后成绩升到 95%。
+Anthropic 曾记录 Opus 4.5 在 CORE-Bench 上初始只得 42%，后来发现原因包括过于严格的数值匹配、模糊的任务规范和不可复现的随机性——修复这些问题后成绩升到 95%。
 
 ### Model-based Grader（LLM Judge）
 
@@ -194,15 +194,9 @@ Terminal-Bench 对这个框架的具体实现：
 - 多个并发 Trial 不共享文件系统或进程状态
 - 重试失败的 Trial 从相同起始状态开始
 
-### 结果聚合：pass@k 的无偏估计
+### 结果聚合
 
-Terminal-Bench 的 harness 对 pass@k 使用无偏估计，而不是直接统计：
-
-$$
-\text{pass@k} = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}
-$$
-
-其中 n 是总 Trial 数，c 是成功 Trial 数，k 是关心的尝试次数。这个公式来自 HumanEval 论文，比简单的成功率更准确地估计了「在 k 次尝试中至少成功一次」的概率。
+Terminal-Bench 使用 HumanEval 论文的无偏估计公式来计算 pass@k（详见下一节 Evaluation Metrics），而不是直接用成功率除以总次数。这个选择在 Trial 数量有限时尤其重要——朴素统计会高估或低估真实的通过概率。
 
 ---
 
@@ -214,11 +208,19 @@ $$
 
 两个指标，回答完全不同的问题。
 
-**pass@k** 衡量在 k 次尝试中至少成功一次的概率：
+**pass@k** 衡量在 k 次尝试中至少成功一次的概率。假设单次成功概率为 p，理论公式是：
 
 $$
 \text{pass@k} = 1 - (1-p)^k
 $$
+
+但实际中 p 是未知的——我们手里只有 n 次 Trial 中 c 次成功的观测结果。直接用 c/n 代入上面的公式会引入偏差。HumanEval 论文提出了一个无偏估计器，Terminal-Bench 等项目采用的正是这个版本：
+
+$$
+\text{pass@k} = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}
+$$
+
+两个公式的关系：当 n 趋向无穷大时，无偏估计器收敛到理论公式。在 Trial 数量有限（比如只跑了 5-10 次）时，无偏估计器更可靠。
 
 随着 k 增加，pass@k 越来越高。适合「只要有一次方案可行就满足需求」的场景，比如代码生成工具可以尝试多个方案让用户选择。
 
@@ -263,6 +265,8 @@ Agent Failure、Environment Failure、Grader Failure 和 Harness Failure 需要�
 
 ### Coding Agent：Terminal-Bench / Harbor
 
+> Grader 类型：**Code-based**（pytest 测试 + 环境状态检查）
+
 终端 Agent 有一个便利条件：软件执行结果通常存在确定性证据。代码能不能编译，测试能不能通过，服务是否真的监听端口——这些都比对 Agent 最终回复做文本匹配更可信。
 
 **Deterministic Grader 优先**。不是因为简单，而是因为对于有明确正确性标准的任务，它比 LLM Judge 更快、更准、更便宜。Terminal-Bench 的 write-compressor 例子：解压后的文件是否与原始文件逐字节相同，pytest 一行断言就够了。
@@ -273,29 +277,21 @@ Agent Failure、Environment Failure、Grader Failure 和 Harness Failure 需要�
 
 ### Conversational Agent：tau2-bench
 
+> Grader 类型：**Code-based**（DB Grader 用数据库状态哈希比对，COMMUNICATE Grader 用字符串匹配），部分领域启用 ACTION Grader
+
 客服或业务对话 Agent 的核心挑战：无法用测试脚本模拟真实用户，成功标准同时包含结果正确和交互质量。
 
 [tau2-bench](https://github.com/sierra-research/tau2-bench) 用第二个 LLM 模拟用户，把 Agent、User Simulator 和业务环境同时放进模拟中。
 
-**User Simulator 的三层 Prompt**
+**User Simulator 的分层设计**
 
-tau2-bench 的 User Simulator 系统 prompt 由三层组装：
+tau2-bench 的 User Simulator 不是一个写死的脚本，而是一个分层组装的 LLM 角色：
 
-```
-{全局 simulation_guidelines}    ← 从 .md 文件加载，规定"渐进式披露信息"等通用行为
+- **全局行为规则**：从 .md 文件加载，规定「渐进式披露信息」「不主动提供 Agent 没问的信息」等通用约束
+- **Persona 配置**：注入具体的用户性格和表达风格（如"回答简短""情绪急躁"）
+- **Scenario**：注入本次对话的具体背景——域名、来电原因、用户已知信息、Task 特定的行为指令
 
-<PERSONA_GUIDELINES>
-{具体 Persona 配置}              ← 注入 "MINIMAL VERBOSITY" 等风格规则
-
-<scenario>
-Domain: airline
-Reason for call: 你想取消预订 EHGLP3...
-Known info: 你是 Emma Kim，用户 ID 是 emma_kim_9957。
-Task instructions: 如果 Agent 说无法取消，提及你被告知不需要保险...
-</scenario>
-```
-
-更值得注意的是它的回复生成机制：`flip_roles()` 函数会把消息历史里的 user/assistant 角色互换，让 LLM "认为自己是 Agent"，站在 Agent 的视角生成下一条"用户"消息。这个角色翻转技巧让 User Simulator 能动态响应当前对话状态，而不是走预设脚本。
+这种分层让同一套 Simulator 框架通过替换 Scenario 就能生成完全不同的对话场景。回复生成使用角色翻转技巧（`flip_roles()`），把对话历史中的 user/assistant 标签互换，让 Simulator 的 LLM 以 assistant 身份自然续写对话，生成后再转回 user。这使它能根据实时对话状态动态回应，而不是走预设脚本。
 
 **评价 Outcome，不要求 Agent 复现路径**
 
@@ -305,7 +301,7 @@ tau2-bench 的 DB Grader 工作方式：
 2. 用 Agent 实际运行后的数据库状态计算哈希值
 3. 两个哈希相等则通过
 
-只要最终的数据库状态等价，Agent 走的路径不重要。`ACTION` Grader（强制要求匹配特定工具调用序列）默认不启用，只有显式声明需要过程合规的任务才会打开它。
+只要最终的数据库状态等价，Agent 走的路径不重要。`ACTION` Grader（检查工具调用序列是否匹配参考操作）不在默认的 `reward_basis` 中，但在 telecom 等对操作流程有合规性要求的领域被显式启用——这恰好说明了「什么时候过程检查才是必要的」：当合规性本身就是业务要求时。
 
 多个 Grader 通过 `reward_basis` 字段组合，最终 reward 是各 Grader 分数的乘积：
 
@@ -320,6 +316,8 @@ tau2-bench 的 DB Grader 工作方式：
 用户不会对客服 Agent 说「你今天失败了，再来一次」。它今天正确退款，明天同样请求却违反 Policy，体验依旧不可接受。对话 Agent 的可靠性要求比一次性成功率更重要，这正是 pass^k 的测量范围。
 
 ### Research Agent：DeepResearch Bench
+
+> Grader 类型：**Model-based**（RACE 用 LLM 做多维度相对评分，FACT 用 LLM 提取和验证引用）
 
 Research Agent 的难点在于没有可以直接验证的单一正确答案。什么叫覆盖全面，什么叫分析有深度，专家之间可能产生分歧。
 
@@ -340,36 +338,26 @@ RACE 的核心 prompt 结构（来自 `prompt/score_prompt_en.py`）：
 
 最终分数是相对分：`score = article_1_total / (article_1_total + article_2_total)`，0.5 表示与参考报告持平。
 
-评分标准（criteria）不是固定的——对每个任务，系统会先让 LLM 生成维度权重（对同一任务采样 5 次取平均，归一化），再对 comprehensiveness、insight、instruction_following、readability 四个维度各自生成细粒度的 criterion 列表。一个关于「中国中产阶层财富现状」的研究任务，它的 comprehensiveness 维度可能包含「各阶层实际收入信息的广度（权重 0.15）」「中产阶层规模与财力估算（权重 0.20）」等具体标准，而不是泛泛的「覆盖是否全面」。
+评分标准（criteria）不是固定的，而是按任务动态生成，分三步走：
 
-**FACT：两步 Prompt 验证引用**
+1. 固定四个评分维度：comprehensiveness、insight、instruction_following、readability
+2. 对每个任务，让 LLM 生成各维度的权重（采样 5 次取平均，然后归一化到总和为 1）
+3. 对每个维度，生成针对该任务的细粒度评分标准
 
-FACT 管线检查报告里的每条引用声明是否真的有 URL 内容支撑。
+比如一个关于「中国中产阶层财富现状」的研究任务，它的 comprehensiveness 维度可能包含「各阶层实际收入信息的广度（权重 0.15）」「中产阶层规模与财力估算（权重 0.20）」这样的具体标准，而不是泛泛的「覆盖是否全面」。
 
-Step 1 提取引用（`utils/extract.py`）：
+**FACT：四步管线验证引用可信度**
 
-```
-请从以下研究报告中识别所有引用实例。
-引用可能以以下形式出现：
-1. 文字 + 空格 + 数字，如"...分为 7 个层级 15"
-2. 文字 + [数字]，如"...7 个层级[15]"
-3. [Citation Source](URL)
+FACT 管线检查报告里每条引用声明是否真的有来源支撑，完整流程分四步：
 
-对每处引用，提取 (fact, ref_idx, url) 三元组，输出 JSON list。
-```
+1. **提取**（`utils/extract.py`）：LLM 从报告中识别所有引用实例，提取 (声明, 引用索引, URL) 三元组
+2. **去重**（`utils/deduplicate.py`）：LLM 合并冗余的声明-URL 对，减少后续验证的工作量
+3. **抓取**（`utils/scrape.py`）：通过 Jina API 获取每个 URL 的实际内容
+4. **验证**（`utils/validate.py`）：LLM 逐条判断每条声明是 `supported`（材料中找到依据）、`unsupported`（找不到依据）还是 `unknown`（URL 内容无效，如 404 页面）
 
-Step 2 验证支撑关系（`utils/validate.py`）：
+去重步骤值得注意——它体现了一个实用原则：在昂贵的 LLM 逐条验证之前，先用确定性或低成本手段降噪。这和前面 Grader 选择中"能用代码解决的不要交给 LLM"的思路一脉相承。
 
-```
-你将收到一段参考材料和若干声明。
-请判断每条声明是 'supported'（材料中找到依据）、
-'unsupported'（材料中找不到依据）还是 'unknown'（材料本身无效，如 404 页面）。
-
-<reference>{抓取的 URL 内容}</reference>
-<statements>{声明列表}</statements>
-```
-
-这两条管线合在一起解决了一个容易混淆的问题：一篇报告可以写得很完整但引用全是错的，也可以引用都有支撑但内容肤浅。质量和可信度需要分别测量。
+RACE 和 FACT 合在一起解决了一个容易混淆的问题：一篇报告可以写得很完整但引用全是编的，也可以引用都有来源但内容肤浅。质量和可信度需要分别测量。
 
 **Judge 校准的具体门槛**
 
@@ -393,6 +381,8 @@ DeepResearch Bench 要求使用者先在外部运行 Research Agent，再把报�
 
 ### Computer Use Agent：OSWorld
 
+> Grader 类型：**Code-based**（近 60 种专属 getter 采集 OS 状态 + exact_match / fuzzy_match 等比对函数）
+
 Computer Use Agent 通过截图观察桌面，通过鼠标和键盘操作真实 GUI 应用，评估难度比前三类都高一个量级。[OSWorld](https://github.com/xlang-ai/OSWorld) 在设计上有三处值得借鉴的思路。
 
 **为调试而设计证据，不只是为了打分**
@@ -403,7 +393,7 @@ OSWorld 的每次 Trial 会保存三层证据：
 {result_dir}/{task_id}/
 ├── step_1_20260730@145232.png   ← 每步操作后的截图
 ├── step_2_20260730@145245.png
-├── traj.jsonl                   ← 每步的 action、screenshot_file、即时 reward
+├── traj.jsonl                   ← 每步的 action、screenshot_file 等元数据
 └── recording.mp4                ← 完整录屏
 ```
 
@@ -427,7 +417,7 @@ OSWorld Task 定义里有一个 `evaluator` 字段，它把「如何采集结果
 
 `result.type` 决定用哪种 getter 采集状态——`enable_do_not_track` 读取 Chrome Preferences JSON，`history` 查询 SQLite 数据库，`accessibility_tree` 解析 AT-SPI XML，`vm_file` 从 VM 下载文件再与 HuggingFace 上的 gold 文件比对。
 
-整个项目有 20+ 种 getter 类型，每种对应一类 OS 状态的具体读取方式。这说明了一个根本原则：**Computer Use Agent 的「结果」不是一段文本，而是分散在操作系统各处的状态变更，用通用的字符串匹配来评估文件修改、数据库变更或 UI 状态，必然失真。** 先定义「什么状态是正确结果」，再针对这个状态设计专属的采集逻辑，是更可靠的路径。
+整个项目定义了近 60 种 getter 类型，分布在 chrome、file、misc、vlc 等十多个模块中，每种对应一类 OS 状态的具体读取方式。这说明了一个根本原则：**Computer Use Agent 的「结果」不是一段文本，而是分散在操作系统各处的状态变更，用通用的字符串匹配来评估文件修改、数据库变更或 UI 状态，必然失真。** 先定义「什么状态是正确结果」，再针对这个状态设计专属的采集逻辑，是更可靠的路径。
 
 **Infeasible Task：测试 Agent 知道说不**
 
@@ -446,49 +436,62 @@ OSWorld 包含一类特殊任务：要求 Agent 执行根本不可能完成的�
 
 ---
 
-## 七、搭建 Eval Harness 的五个关键决策
+## 七、从理论到落地
 
-不是一份检查清单，而是五个会影响后续一切的根本性选择。
+前面六节讲的是「好的 Eval 长什么样」，这一节回答一个更实际的问题：**明天就要开始建 Eval，该怎么走第一步？**
 
-### 1. 先定义证据，再选框架
+### 从零开始的最小路径
 
-设计 Eval 的起点不应该是「我要用哪个框架」，而是「什么证据足以证明我的 Agent 真的完成了任务」。
+Anthropic 在原文中反复强调一点：**尽早开始**。不要等到有上百个 Task 才动手——20 到 50 个来自真实失败的简单任务，就已经足够起步。等得越久越被动，因为产品上线之后再回头补 Eval，你面对的不是"把需求翻译成测试用例"，而是"从一个活着的系统里逆向工程出成功标准"。
 
-编码 Agent 的证据可能是测试结果。客服 Agent 的证据是数据库状态和消息内容。Research Agent 的证据分散在内容质量和引用支撑关系里。Computer Use Agent 的证据藏在文件系统、应用配置和截图里。
+任务从哪里来？四个最直接的来源：
 
-证据类型定义清楚，框架选型自然浮现。
+1. **线上失败案例**——每一次用户遇到的 Agent 失败，都可以转化成一个 Regression Task
+2. **手动测试用例**——团队每次发版前手动验证的行为，本来就是等着被自动化的 Eval
+3. **Bug tracker 和客服工单**——用户反馈里藏着最真实的边界场景
+4. **产品需求文档**——每个新功能的验收标准，天然就是 Capability Task 的雏形
 
-### 2. Task 质量是一切的基础
+最小可用的 Eval 系统只需要四样东西：Task 定义（instruction + 成功标准）、隔离环境（哪怕只是 Docker 容器）、确定性 Grader（从能用 pytest 断言的地方开始）、结果记录（把每次 Trial 的 pass/fail 存下来）。不需要 LLM Judge，不需要分布式调度，不需要精美的 Dashboard——先跑起来，先有数据。
 
-一个好的 Task，两位领域专家能独立判断 pass/fail，且专家自己能够完成。
+### 读 Transcript：最容易上手的调试手段
 
-为每个 Task 准备 Reference Solution，在任何 Agent 上线评估前先跑 Oracle Agent（或人工执行参考解法），确认：任务可解、环境依赖完整、Grader 能接受一个已知正确的结果。
+Grader 告诉你 Trial 过了还是没过，但它不告诉你**为什么**。
 
-如果 0% pass@100，先检查 Task，不要急着去优化 Agent。
+Anthropic 把 Transcript 审阅提升到了方法论的高度——不是可选的辅助手段，而是确认 Eval 本身是否靠谱的核心方法。具体来说：
 
-### 3. 同时测试应该做和不应该做
+- Grader 说失败了，但读完 Transcript 你觉得 Agent 的处理方式完全合理——那是 Task 或 Grader 的问题，不是 Agent 的问题。**失败应该看起来公平**。
+- Grader 说成功了，但读完 Transcript 你发现 Agent 只是碰巧走对了——那是 Grader 太宽松了。
+- 你无法判断一个新 Task 的 Grader 是否合理，除非你亲眼看过几条 Transcript 的评分逻辑。
 
-只测试「Agent 是否在该搜索时搜索」，可能优化出一个什么都搜索的 Agent。只测试「Agent 是否在该退款时退款」，会漏掉不满足条件时乱退款的问题。
+OSWorld 保存的三层证据（逐步截图、traj.jsonl、录屏）正是为此服务的。Terminal-Bench 的备份恢复机制也是在 Transcript 审阅中发现 Agent 存在作弊可能后设计的防御措施。
 
-Capability Eval 和 Regression Eval 都需要正负样本平衡。
+这是**明天就能做的事**：跑一轮 Eval，挑出几个失败 Trial，逐条读 Transcript，问自己"这个失败公平吗"。
 
-### 4. 确定性 Grader 优先，LLM Judge 要校准
+### Eval 驱动开发
 
-能用状态和测试验证的，不要轻易交给 LLM Judge。tau2-bench 的 COMMUNICATE Grader 只做字符串匹配，不是因为不够精细，而是对于「是否告知了用户确认号」这类明确要求，substring 匹配已经足够可靠，引入 LLM Judge 只会增加噪声和成本。
+一个容易被忽略的用法：先写 Eval，再开发能力。
 
-必须用 LLM Judge 时：分维度单独评分，提供结构化 Rubric，允许输出 Unknown，并保持一批人工标注样本用于持续校准。DeepResearch Bench 的 Judge 需要在 50 个任务的人工标注子集上超过人工基准一致率，才会被选用。
+Anthropic 称之为 Eval-Driven Development，思路类似 TDD——在 Agent 还不具备某项能力时，就把这项能力定义为 Capability Task。初始通过率很低，这正是它的价值所在：你下注了一个方向，每次模型升级或 prompt 调整后跑一遍 Suite，就能看到这些赌注哪些兑现了。
 
-Judge 模型版本切换时，历史分数不再可比，需要版本迁移方案。
+### Eval 不是唯一的安全网
 
-### 5. Suite 是活的软件
+最后一个容易踩的坑：把 Eval 当成质量保障的全部。
 
-Task、Environment、Harness 和 Grader 都需要版本号和负责人。
+Anthropic 用「瑞士奶酪模型」来描述这个问题——自动化 Eval、生产监控、A/B 测试、用户反馈、人工 Transcript 审阅，每一层都有漏洞，没有哪一层能独立覆盖全部风险。一个通过率 95% 的 Eval Suite 并不意味着 Agent 可以放心上线——它只意味着在这个 Suite 覆盖的范围内表现良好。Suite 之外的盲区，需要其他机制来补。
 
-线上新出现的失败案例，应该转化为 Regression Task。已经接近满分的 Capability Task，需要升级为更难的版本。含糊或失效的 Task 要及时修复，而不是保留下来拉低信噪比。
+### 操作清单
 
-tau2-bench 在 2026 年 7 月发布 v1.0.1 grading update 时明确说明，受影响领域的新旧版分数不可直接比较；DeepResearch Bench 更换 Judge 时维护了分开的排行榜迁移说明；OSWorld 推出 Verified 版本修复了一批 Task 和环境问题。这些不是 Benchmark 不专业的证据，恰恰说明高质量 Eval 必须允许自己被纠正。
+把上面的内容压缩成一个可以按顺序 follow 的清单：
 
-每次 Eval 运行，至少记录：Task Suite 版本、模型版本、Agent Harness 与 Prompt 版本、环境镜像、Grader 版本和关键参数。少了这些信息，今天的 70 分和下个月的 73 分可能不是同一把尺子量的。
+1. **收集 20-50 个 Task**，优先来自真实失败和手动测试
+2. **写清每个 Task 的成功标准**，确保两个领域专家能独立达成 pass/fail 共识
+3. **为每个 Task 准备 Reference Solution**，先跑 Oracle Agent 确认任务可解
+4. **正反样本平衡**——不只测 Agent 该做什么，也测它不该做什么
+5. **确定性 Grader 优先**，LLM Judge 留给有明确 Rubric 的主观任务，并用人工标注持续校准
+6. **隔离每次 Trial**，从干净环境启动，不共享状态
+7. **跑完第一轮，读 Transcript**，确认失败看起来公平
+8. **版本化一切**——每次运行记录 Task Suite 版本、模型版本、Agent Harness 版本、Grader 版本
+9. **持续迭代**——线上失败转化为 Regression Task，接近满分的 Capability Task 升级为更难的版本，失效的 Task 及时修复
 
 ---
 
