@@ -159,47 +159,32 @@ def test_compression_size():
 
 ### 执行流程
 
+一次 Eval 的执行可以抽象为以下流程，Evaluation Harness 是整个循环的驱动者：
+
 ```mermaid
-sequenceDiagram
-    participant CLI as tb run (CLI)
-    participant H as Harness
-    participant TH as TrialHandler
-    participant T as Terminal<br/>(Docker+tmux)
-    participant A as Agent
-    participant P as PytestParser
-
-    CLI->>H: Harness.run()
-    H->>H: ThreadPoolExecutor<br/>(n_concurrent_trials)
-    H->>TH: TrialHandler(task.yaml)
-    TH->>TH: Task Pydantic model 验证字段
-    TH->>TH: 根据 parser_name 选 PytestParser
-
-    H->>T: spin_up_terminal()
-    T->>T: docker compose up
-    T->>T: tmux new-session "agent"
-
-    H->>A: AgentFactory.create(agent_type)
-    H->>A: agent.perform_task(instruction, tmux_session)
-    A->>T: 通过 tmux send-keys 执行命令
-    T-->>A: 读取 tmux pane 输出
-
-    H->>T: _run_tests()
-    T->>T: cp tests/ → /tests/ in container
-    T->>T: bash /tests/run-tests.sh
-    T->>T: pytest test_outputs.py -rA
-
-    H->>P: _parse_results(post_test_pane)
-    P->>P: 解析 pytest 输出
-    P-->>H: {test_name: PASSED/FAILED}
-
-    H->>H: is_resolved = all(PASSED)
-    H->>H: write results.json
-    H->>T: docker compose down
+flowchart TD
+    T["Task\n任务定义 + 成功标准"] --> H["Evaluation Harness"]
+    H --> E["初始化独立环境\nEnvironment Setup"]
+    E --> A["启动 Agent Harness + 模型"]
+    A <-->|"工具调用 / 状态变更"| E
+    A -->|"结束或超时"| G
+    E -->|"最终环境状态 Outcome"| G["Grader 评分"]
+    G --> R["Trial Result"]
+    R -->|"重复 N 次"| E
+    R -->|"聚合"| M["Suite Metrics\npass@k / pass^k / ..."]
 ```
 
-关键点：Agent 结束后，harness 将 `tests/` 目录复制进容器，运行 `bash run-tests.sh`，捕获 pytest 的终端输出，再由 `PytestParser` 解析每个测试的 `PASSED`/`FAILED` 状态，`all(PASSED)` 才算任务完成。
+Terminal-Bench 对这个框架的具体实现：
 
-不是 Agent 输出「done」就完成了，也不是进程正常退出就算成功。
+| 抽象组件 | Terminal-Bench 实现 |
+|---|---|
+| Task | `task.yaml`（instruction、parser_name、超时配置） |
+| 独立环境 | Docker 容器（docker-compose.yaml 定义） |
+| Agent Harness | Claude Code、aider 等，通过 tmux 与容器交互 |
+| Grader | `run-tests.sh` → pytest → `PytestParser` 解析输出 |
+| Trial Result | `results.json`（per-trial 得分与元数据） |
+
+**关键点**：决定 Trial 是否成功的，是 Grader 看到的环境状态，不是 Agent 输出的那句「done」，也不是进程正常退出。`PytestParser` 解析 pytest 的终端输出，`all(PASSED)` 才算通过。
 
 ### 隔离的重要性
 
@@ -213,9 +198,11 @@ sequenceDiagram
 
 Terminal-Bench 的 harness 对 pass@k 使用无偏估计，而不是直接统计：
 
-$$\text{pass@k} = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}$$
+$$
+\text{pass@k} = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}
+$$
 
-其中 $n$ 是总 Trial 数，$c$ 是成功 Trial 数，$k$ 是关心的尝试次数。这个公式来自 HumanEval 论文，比简单的成功率更准确地估计了「在 k 次尝试中至少成功一次」的概率。
+其中 n 是总 Trial 数，c 是成功 Trial 数，k 是关心的尝试次数。这个公式来自 HumanEval 论文，比简单的成功率更准确地估计了「在 k 次尝试中至少成功一次」的概率。
 
 ---
 
@@ -227,21 +214,25 @@ $$\text{pass@k} = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}$$
 
 两个指标，回答完全不同的问题。
 
-**pass@k** 衡量在 $k$ 次尝试中至少成功一次的概率：
+**pass@k** 衡量在 k 次尝试中至少成功一次的概率：
 
-$$\text{pass@k} = 1 - (1-p)^k$$
+$$
+\text{pass@k} = 1 - (1-p)^k
+$$
 
-随着 $k$ 增加，pass@k 越来越高。适合「只要有一次方案可行就满足需求」的场景，比如代码生成工具可以尝试多个方案让用户选择。
+随着 k 增加，pass@k 越来越高。适合「只要有一次方案可行就满足需求」的场景，比如代码生成工具可以尝试多个方案让用户选择。
 
-**pass^k** 衡量连续 $k$ 次全部成功的概率：
+**pass^k** 衡量连续 k 次全部成功的概率：
 
-$$\text{pass}^k = p^k$$
+$$
+\text{pass}^k = p^k
+$$
 
-随着 $k$ 增加，pass^k 越来越低。一个单次成功率 75% 的 Agent，连续三次都成功的概率约为 $0.75^3 \approx 42\%$。
+随着 k 增加，pass^k 越来越低。一个单次成功率 75% 的 Agent，连续三次都成功的概率约为 0.75³ ≈ 42%。
 
 对于客服、支付、审批这类用户期待每次都可靠的 Agent，pass^k 比 pass@k 更接近真实的产品要求。
 
-两个指标在 $k=1$ 时相同（都等于单次成功率），随着 $k$ 增大讲述完全相反的故事：pass@k 趋向 100%，pass^k 趋向 0%。
+两个指标在 k=1 时相同（都等于单次成功率），随着 k 增大讲述完全相反的故事：pass@k 趋向 100%，pass^k 趋向 0%。
 
 ### 效率层
 
@@ -276,7 +267,7 @@ Agent Failure、Environment Failure、Grader Failure 和 Harness Failure 需要�
 
 **Deterministic Grader 优先**。不是因为简单，而是因为对于有明确正确性标准的任务，它比 LLM Judge 更快、更准、更便宜。Terminal-Bench 的 write-compressor 例子：解压后的文件是否与原始文件逐字节相同，pytest 一行断言就够了。
 
-**Reference Solution 的价值**。在评估任何 Agent 之前，先用 Oracle Agent 在相同环境里执行参考解法，确认任务可解、环境依赖齐全、测试逻辑能接受已知正确的结果。一个 0% pass@100 的任务，最大的可能不是 Agent 太弱，而是 Task 写坏了。
+**Reference Solution 的价值**。在评估任何 Agent 之前，先用 Oracle Agent（一个执行参考解法的专属 Agent，不参与评估竞争，仅用来验证 Task 和 Grader 本身的正确性）在相同环境里执行参考解法，确认任务可解、环境依赖齐全、测试逻辑能接受已知正确的结果。一个 0% pass@100 的任务，最大的可能不是 Agent 太弱，而是 Task 写坏了。
 
 **Verifier Isolation**。[Harbor](https://harborframework.com/) 支持在独立环境中运行 Verifier，Agent 所在环境只把声明过的 artifact 交给 Verifier，评分代码不暴露给 Agent。对于存在作弊风险的任务，这一隔离很关键——如果 Agent 能读取或修改 Grader，它测到的就不再是完成任务的能力，而是寻找评分漏洞的能力。
 
@@ -402,19 +393,31 @@ DeepResearch Bench 要求使用者先在外部运行 Research Agent，再把报�
 
 ### Computer Use Agent：OSWorld
 
-Computer Use Agent 通过截图观察桌面，通过鼠标和键盘操作真实 GUI 应用。评估需要启动完整操作系统环境，并在任务结束后检查文件、配置、数据库等多类型状态。
+Computer Use Agent 通过截图观察桌面，通过鼠标和键盘操作真实 GUI 应用，评估难度比前三类都高一个量级。[OSWorld](https://github.com/xlang-ai/OSWorld) 在设计上有三处值得借鉴的思路。
 
-[OSWorld](https://github.com/xlang-ai/OSWorld) 的 Task 定义（Chrome「Do Not Track」示例）：
+**为调试而设计证据，不只是为了打分**
+
+OSWorld 的每次 Trial 会保存三层证据：
+
+```
+{result_dir}/{task_id}/
+├── step_1_20260730@145232.png   ← 每步操作后的截图
+├── step_2_20260730@145245.png
+├── traj.jsonl                   ← 每步的 action、screenshot_file、即时 reward
+└── recording.mp4                ← 完整录屏
+```
+
+Grader 只告诉你 Trial 失败了，三层证据才能回答「Agent 看到的界面是否正常」「点击坐标是否偏移」「应用是不是还在加载」。
+
+这和 Anthropic 原文「Step 6: Check the transcripts」强调的思路一致：自动评分是第一道门槛，人工回看轨迹是调试 Eval 自身、判断失败是否公平的必要手段。Grader 说不通过，并不代表 Agent 真的做错了。
+
+**每类证据需要专属的采集手段**
+
+OSWorld Task 定义里有一个 `evaluator` 字段，它把「如何采集结果」和「如何比对结果」解耦：
 
 ```json
 {
-  "snapshot": "chrome",
-  "instruction": "Can you enable the 'Do Not Track' feature in Chrome?",
-  "config": [
-    { "type": "launch", "parameters": { "command": ["google-chrome", "--remote-debugging-port=1337"] } }
-  ],
   "evaluator": {
-    "postconfig": [{ "type": "sleep", "parameters": { "seconds": 1.0 } }],
     "func": "exact_match",
     "result": { "type": "enable_do_not_track" },
     "expected": { "type": "rule", "rules": { "expected": "true" } }
@@ -422,48 +425,15 @@ Computer Use Agent 通过截图观察桌面，通过鼠标和键盘操作真实 
 }
 ```
 
-`snapshot` 指定 VM 要恢复到的快照，确保每次 Trial 从相同起始状态开始。`config` 是 Agent 开始前的初始化步骤（打开应用、下载文件等）。`evaluator.postconfig` 在 Agent 结束后、评分前执行（比如保存文件、重启浏览器）。最后 `evaluator.func` 决定用哪个 metric 函数打分。
+`result.type` 决定用哪种 getter 采集状态——`enable_do_not_track` 读取 Chrome Preferences JSON，`history` 查询 SQLite 数据库，`accessibility_tree` 解析 AT-SPI XML，`vm_file` 从 VM 下载文件再与 HuggingFace 上的 gold 文件比对。
 
-**20+ 种 Getter，30+ 种 Metric**
-
-OSWorld 为不同类型的状态证据设计了专门的采集手段（getter）：
-
-- `vm_command_line`：在 VM 里执行 shell 命令，返回 stdout
-- `enable_do_not_track`：读取 Chrome Preferences JSON 里的对应字段
-- `history`：查询 Chrome History SQLite 数据库
-- `accessibility_tree`：获取 AT-SPI accessibility tree XML
-- `vm_file`：通过 HTTP API 从 VM 下载文件
-- `cloud_file`：从 HuggingFace 下载参考（gold）文件
-
-对应的 metric 函数则有 `compare_table`（电子表格对比）、`compare_docx_tables`、`check_accessibility_tree`（XPath 查询）、`compare_videos` 等。
-
-评分的多样性直接反映了「Computer Use Agent 的结果」是什么：它不是一段文本，而是分散在操作系统各处的状态变更。
+整个项目有 20+ 种 getter 类型，每种对应一类 OS 状态的具体读取方式。这说明了一个根本原则：**Computer Use Agent 的「结果」不是一段文本，而是分散在操作系统各处的状态变更，用通用的字符串匹配来评估文件修改、数据库变更或 UI 状态，必然失真。** 先定义「什么状态是正确结果」，再针对这个状态设计专属的采集逻辑，是更可靠的路径。
 
 **Infeasible Task：测试 Agent 知道说不**
 
-OSWorld 包含一类特殊任务：任务本身不可能完成（比如「将 Chrome 语言改为 Xenothian 语」）。正确行为是 Agent 输出 `FAIL` 动作。如果 Agent 输出 `FAIL` 则得 1.0 分，否则 0 分。
+OSWorld 包含一类特殊任务：要求 Agent 执行根本不可能完成的操作（比如「将 Chrome 语言改为 Xenothian 语」，Xenothian 是虚构语言）。正确行为是 Agent 输出 `FAIL` 动作，得分 1.0；如果 Agent 尝试去做，得 0 分。
 
-这类任务测量的是 Agent 的边界识别能力，而不是执行能力。
-
-**证据记录**
-
-每步执行后保存截图：
-
-```
-{result_dir}/{task_id}/
-├── step_1_20260730@145232.png
-├── step_2_20260730@145245.png
-├── traj.jsonl          ← 每步的 action、screenshot_file、reward
-└── recording.mp4       ← 完整录屏
-```
-
-这些证据不是装饰，而是在失败后回答「Agent 是否看到了弹窗」「点击坐标是否偏移」「应用是不是还在加载」的唯一依据。
-
-**失败分类的缺口**
-
-OSWorld 没有结构化的失败类型字段，只有 `possibility_of_env_change`（low/medium/high）标记依赖外部环境的任务。一个任务失败，是 Agent 操作错了、快照没恢复成功、Evaluator 读了错误的文件路径、还是 VM 控制接口崩溃了——这些需要人工检查 `runtime.log` 和录屏才能区分。
-
-相比之下，Terminal-Bench 和 Harbor 在 Trial 结束后会明确记录 Harness 错误、超时和无效 Trial，让失败归因更容易。对于 Computer Use Eval 来说，建立明确的失败分类机制是一个值得填补的设计缺口。
+这类任务评估的是 Agent 的边界识别能力——能识别不可能完成的指令，是生产级 Agent 区别于 demo Agent 的特质之一。它直接呼应 Anthropic 原文「Build balanced problem sets」的建议：不只测 Agent 能做什么，也测它是否会在不该做的时候拒绝。只有正向测试的 Eval 套件，很可能优化出一个凡事都试图完成的 Agent。
 
 ### 对比
 
@@ -472,7 +442,7 @@ OSWorld 没有结构化的失败类型字段，只有 `possibility_of_env_change
 | Terminal-Bench / Harbor | 终端与编码 Agent | 隔离 Docker 容器 | pytest 测试结果 + 环境产物 | Task 质量与 Verifier 隔离 |
 | tau2-bench | 对话工具 Agent | User Simulator + 业务数据库 | 数据库状态哈希 + 消息内容 | 用户模拟真实性与可靠性 |
 | DeepResearch Bench | Research Agent 报告 | 报告文件 + 外部 URL | RACE 多维度分 + FACT 引用验证 | 主观质量与 Judge 校准 |
-| OSWorld | Computer Use Agent | VM + 真实桌面应用 | 文件/配置/数据库/截图 | 环境可靠性与失败分类 |
+| OSWorld | Computer Use Agent | VM + 真实桌面应用 | 文件/配置/数据库/截图 | 证据多样性与边界识别测试 |
 
 ---
 
@@ -531,8 +501,3 @@ Terminal-Bench、tau2-bench、DeepResearch Bench 和 OSWorld，没有共享同�
 所有的设计差异，都是围绕「什么才是这类 Agent 真正完成任务的可信证据」展开的。
 
 Agent Eval 的目标，从来不是把一个复杂系统压缩成排行榜上的单个数字。而是让团队下一次再说「Agent 好像变差了」时，可以打开证据，看见失败，然后修掉它。
-
----
-
-> 作者：卡兹克  
-> 投稿或交流：wzglyay@virxact.com
