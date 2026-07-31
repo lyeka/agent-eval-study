@@ -287,7 +287,7 @@ Agent Failure、Environment Failure、Grader Failure 和 Harness Failure 需要�
 
 tau2-bench 的 User Simulator 不是一个写死的脚本，而是一个分层组装的 LLM 角色：
 
-- **全局行为规则**：从 .md 文件加载，规定「渐进式披露信息」「不主动提供 Agent 没问的信息」等通用约束
+- **全局行为规则**：从 .md 文件加载，规定「渐进式披露信息」「不主动提供 Agent 没问的信息」等通用约束（下文展开）
 - **Persona 配置**：注入具体的用户性格和表达风格（如"回答简短""情绪急躁"）
 - **Scenario**：注入本次对话的具体背景——域名、来电原因、用户已知信息、Task 特定的行为指令
 
@@ -296,6 +296,35 @@ tau2-bench 的 User Simulator 不是一个写死的脚本，而是一个分层�
 为什么一定要用 LLM 来模拟用户，而不是写一组固定脚本？因为脚本式的用户只会按预设顺序念台词——无论 Agent 回复了什么，下一句都是一样的。但真实用户会根据 Agent 的回答调整自己的行为：Agent 问了额外的问题，用户会回应；Agent 理解错了，用户会纠正；Agent 给了不完整的信息，用户会追问。这些动态交互中的 Agent 行为，恰恰是 Eval 最需要覆盖的部分。固定脚本只能测到一条死路径，LLM 模拟的用户则能测出 Agent 在不同对话走向下的表现。
 
 实现上有一个技术约束：LLM 的 Chat API 只能生成 `assistant` 角色的消息，没法直接让它输出 `user` 消息。tau2-bench 的解决方式是在调用 LLM 之前，用 `flip_roles()` 把对话历史中的角色标签全部互换——Agent 之前说的 `assistant` 消息变成 `user` 输入，Simulator 之前说的 `user` 消息变成 `assistant` 历史。这样 LLM 自然以 `assistant` 身份续写对话，生成后再把输出转回 `user`。
+
+**渐进式信息披露：Eval 在测 Agent 的什么能力**
+
+上面三层结构描述了 Simulator 用什么组装而成。但贯穿三层的最关键行为约束，是信息怎么流出来——渐进式地、被动地，而不是一次性倾倒。这个机制由数据结构、行为规则和质量控制三步协作完成。
+
+第一步，Task 数据结构把用户的知识切分成四个隔间。每个 Task 的 `StructuredUserInstructions` 包含四个字段：
+
+```json
+{
+  "reason_for_call": "You want to cancel reservation EHGLP3. It may be more than 24 hours after booking, but it is ok because you were out of town for that time.",
+  "known_info": "You are Emma Kim. Your user id is emma_kim_9957.",
+  "unknown_info": null,
+  "task_instructions": "If Agent tells you that cancellation is not possible, mention that you were told that you didn't need to get insurance because your previous trip was booked with the same agency with insurance."
+}
+```
+
+`reason_for_call` 是用户主动说出的来电原因——这是对话的起点，Simulator 会在第一句话里表达它。`known_info` 是用户**可以**回答但不会主动说的事实（姓名、用户 ID、确认号），只有 Agent 明确问到时才提供。`unknown_info` 是用户明确不知道的信息——retail 域 78% 的 Task 都包含这个字段（最常见的是"You do not remember your email address"），迫使 Agent 用工具去查询而非追问用户。`task_instructions` 是条件式行为指令，通常采用「If...then」结构，只在 Agent 说了特定内容时才触发——比如上面这个例子，只有 Agent 拒绝取消时用户才会提起保险的事。
+
+这四个字段共同制造了一种现实的信息不对称：Simulator 手里有一些信息可以给，有一些必须拒绝，还有一些只在特定条件下才解锁。Agent 必须主动提问、使用工具、根据对话走向调整策略，才能拿到完成任务所需的全部信息。
+
+第二步，全局行为规则把渐进式披露写成硬约束。`simulation_guidelines.md` 明确要求：
+
+> Disclose information progressively. Wait for the agent to ask for specific information before providing it.
+
+语音变体（`simulation_guidelines_voice.md`）的"Information Disclosure"章节给出了更具体的操作模式：先说「I have a problem」，被追问才说「The app」，再追问才说「Your mobile app」。如果 Agent 一次问了多条信息，也只回答一条。甚至会模拟"忘记"细节：「My order number is... um, let me check... hold on...」。
+
+第三步，质量控制机制捕捉违规。后文会提到的 Reviewer 系统定义了 `revealed_info_early` 错误标签——"Shared information before it was appropriate or before proper verification"。严重级别可以标记为 `critical_helped`，意味着用户过早泄露信息让 Agent 不公平地获得了优势，整个 Trial 的评分可信度因此打折。
+
+这个三层机制到底在测什么？测的是 Agent 的**信息收集能力**——在不确定条件下，通过提问、推理和工具使用逐步获取完成任务所需信息的能力。如果 Simulator 把所有信息一股脑倒出来，Agent 永远不需要问澄清问题，eval 退化成了单轮 QA 测试。更微妙的一点是：扮演用户的 LLM 天然倾向于"帮忙"——它知道全部 Scenario 信息，本能地想把所有东西都告诉对方。渐进式披露是对这种合作本能的**对抗性约束**，确保 Simulator 行为接近真实用户，而不是一个无限配合的理想对话伙伴。
 
 **评价 Outcome，不要求 Agent 复现路径**
 
