@@ -81,7 +81,7 @@ Anthropic 曾记录 Opus 4.5 在 CORE-Bench 上初始只得 42%，后来发现�
 
 ### Model-based Grader（LLM Judge）
 
-方法包括基于 Rubric 的评分、自然语言断言检查、候选答案对比和多评委投票。
+方法包括基于 Rubric（评分准则，定义了各评估维度及其具体标准的结构化文档）的评分、自然语言断言检查、候选答案对比和多评委投票。
 
 优点：能处理主观任务和开放式输出，可以根据自然语言 Rubric 判断连贯性、深度和指令遵循。
 缺点：有随机性、成本更高，还可能带着 Judge 模型自身的偏见。
@@ -196,7 +196,7 @@ Terminal-Bench 对这个框架的具体实现：
 
 ### 结果聚合
 
-Terminal-Bench 使用 HumanEval 论文的无偏估计公式来计算 pass@k（详见下一节 Evaluation Metrics），而不是直接用成功率除以总次数。这个选择在 Trial 数量有限时尤其重要——朴素统计会高估或低估真实的通过概率。
+Terminal-Bench 使用 HumanEval 论文（Chen et al., "Evaluating Large Language Models Trained on Code"，最早提出 pass@k 无偏估计方法的工作）的公式来计算 pass@k（详见下一节 Evaluation Metrics），而不是直接用成功率除以总次数。这个选择在 Trial 数量有限时尤其重要——朴素统计会高估或低估真实的通过概率。
 
 ---
 
@@ -273,15 +273,15 @@ Agent Failure、Environment Failure、Grader Failure 和 Harness Failure 需要�
 
 **Reference Solution 的价值**。在评估任何 Agent 之前，先用 Oracle Agent（一个执行参考解法的专属 Agent，不参与评估竞争，仅用来验证 Task 和 Grader 本身的正确性）在相同环境里执行参考解法，确认任务可解、环境依赖齐全、测试逻辑能接受已知正确的结果。一个 0% pass@100 的任务，最大的可能不是 Agent 太弱，而是 Task 写坏了。
 
-**Verifier Isolation**。[Harbor](https://harborframework.com/) 支持在独立环境中运行 Verifier，Agent 所在环境只把声明过的 artifact 交给 Verifier，评分代码不暴露给 Agent。对于存在作弊风险的任务，这一隔离很关键——如果 Agent 能读取或修改 Grader，它测到的就不再是完成任务的能力，而是寻找评分漏洞的能力。
+**Verifier Isolation**。[Harbor](https://harborframework.com/) 支持在独立环境中运行 Verifier（验证器，即负责运行评分逻辑的组件），Agent 所在环境只把声明过的 artifact（Agent 产出的文件或数据，比如生成的代码、编译产物、输出文件）交给 Verifier，评分代码不暴露给 Agent。对于存在作弊风险的任务，这一隔离很关键——如果 Agent 能读取或修改 Grader，它测到的就不再是完成任务的能力，而是寻找评分漏洞的能力。
 
 ### Conversational Agent：tau2-bench
 
 > Grader 类型：**Code-based**（DB Grader 用数据库状态哈希比对，COMMUNICATE Grader 用字符串匹配），部分领域启用 ACTION Grader
 
-客服或业务对话 Agent 的核心挑战：无法用测试脚本模拟真实用户，成功标准同时包含结果正确和交互质量。
+客服或业务对话 Agent 的核心挑战：无法用测试脚本模拟真实用户，而且成功标准不只是"结果对不对"，还可能涉及交互质量——语气是否恰当、是否在合理轮次内完成、有没有遗漏必须传达的信息。
 
-[tau2-bench](https://github.com/sierra-research/tau2-bench) 用第二个 LLM 模拟用户，把 Agent、User Simulator 和业务环境同时放进模拟中。
+[tau2-bench](https://github.com/sierra-research/tau2-bench) 用第二个 LLM 模拟用户，把 Agent、User Simulator 和业务环境同时放进模拟中。在这些维度中，tau2-bench 选择聚焦在**可确定性验证的结果正确性**上——数据库状态是否正确、关键信息是否传达——而没有把语气、礼貌度、对话效率等主观交互质量纳入评分。这个取舍值得注意：它意味着你可以信赖 tau2-bench 的分数来判断 Agent 是否完成了任务，但不能用它来判断 Agent 完成任务的方式是否让用户舒服。
 
 **User Simulator 的分层设计**
 
@@ -291,13 +291,17 @@ tau2-bench 的 User Simulator 不是一个写死的脚本，而是一个分层�
 - **Persona 配置**：注入具体的用户性格和表达风格（如"回答简短""情绪急躁"）
 - **Scenario**：注入本次对话的具体背景——域名、来电原因、用户已知信息、Task 特定的行为指令
 
-这种分层让同一套 Simulator 框架通过替换 Scenario 就能生成完全不同的对话场景。回复生成使用角色翻转技巧（`flip_roles()`），把对话历史中的 user/assistant 标签互换，让 Simulator 的 LLM 以 assistant 身份自然续写对话，生成后再转回 user。这使它能根据实时对话状态动态回应，而不是走预设脚本。
+这种分层让同一套 Simulator 框架通过替换 Scenario 就能覆盖完全不同的对话场景。
+
+为什么一定要用 LLM 来模拟用户，而不是写一组固定脚本？因为脚本式的用户只会按预设顺序念台词——无论 Agent 回复了什么，下一句都是一样的。但真实用户会根据 Agent 的回答调整自己的行为：Agent 问了额外的问题，用户会回应；Agent 理解错了，用户会纠正；Agent 给了不完整的信息，用户会追问。这些动态交互中的 Agent 行为，恰恰是 Eval 最需要覆盖的部分。固定脚本只能测到一条死路径，LLM 模拟的用户则能测出 Agent 在不同对话走向下的表现。
+
+实现上有一个技术约束：LLM 的 Chat API 只能生成 `assistant` 角色的消息，没法直接让它输出 `user` 消息。tau2-bench 的解决方式是在调用 LLM 之前，用 `flip_roles()` 把对话历史中的角色标签全部互换——Agent 之前说的 `assistant` 消息变成 `user` 输入，Simulator 之前说的 `user` 消息变成 `assistant` 历史。这样 LLM 自然以 `assistant` 身份续写对话，生成后再把输出转回 `user`。
 
 **评价 Outcome，不要求 Agent 复现路径**
 
 tau2-bench 的 DB Grader 工作方式：
 
-1. 用 reference actions（参考操作序列）在干净的 Gold Environment 里重放，得到目标数据库状态的哈希值
+1. 在一个干净的 Gold Environment（与 Agent 运行环境初始状态完全相同的独立副本）里，重放 reference actions（Task 预定义的"标准答案"操作序列，比如"调用 cancel_booking 工具，参数为订单号 EHGLP3"），得到目标数据库状态的哈希值
 2. 用 Agent 实际运行后的数据库状态计算哈希值
 3. 两个哈希相等则通过
 
@@ -311,6 +315,19 @@ tau2-bench 的 DB Grader 工作方式：
 
 `COMMUNICATE` Grader 只做字符串匹配，检查 Agent 的消息里是否包含要求告知用户的关键信息——没有 LLM Judge，简单直接。
 
+**交互质量：理论建议 vs 实际实现**
+
+Anthropic 原文在讨论对话 Agent Eval 时，给出了一个理论示例——一个退款场景的 Grader 配置，其中包含 `llm_rubric` 类型的 Grader，引用 `prompts/support_quality.md` 作为评分准则，断言如"Agent showed empathy for customer's frustration""Resolution was clearly explained"。原文将 tau2-bench 作为"incorporate multidimensionality"的代表项目引用。
+
+但需要指出的是：**这个 LLM Rubric 示例是 Anthropic 建议的理论设计，不是 tau2-bench 源码中的实际实现。** tau2-bench 的评分（reward）完全由确定性 Grader 决定——DB 哈希比对和 COMMUNICATE 子串匹配。它没有实现任何 LLM Rubric 来评估语气、共情或对话效率。
+
+tau2-bench 源码里确实存在两个与交互质量沾边的模块，但都不影响核心评分：
+
+- **Reviewer 系统**（`evaluator/reviewer.py`）：用 LLM 检测 policy violation、hallucination 等错误，但源码明确注明"不同于 evaluator，不计入 reward"。它的主要用途是反向评估 User Simulator 的保真度，而非 Agent 的交互质量。
+- **Voice 交互指标**（`metrics/voice_interaction_metrics.py`）：在全双工语音模式下测量响应延迟、打断让步率等 8 个维度，但仅限语音场景，且与 reward 分开报告。
+
+这个差距恰好说明了一个实际问题：**对话 Agent 的交互质量评估在理论上清晰，在工程上尚未成熟。** Anthropic 说得对——"语气是否得当"应该用 LLM Rubric 来评，这是对话 Agent 区别于 Coding Agent 的关键维度。但 tau2-bench 选择先用确定性 Grader 把结果正确性打牢，把 LLM Rubric 留给未来。如果你在构建自己的对话 Agent Eval，交互质量维度（共情、清晰度、轮次效率）是 tau2-bench 没有覆盖但 Anthropic 明确建议补上的部分——参考原文的 `support_quality.md` 示例设计你自己的 Rubric。
+
 **pass^k 比 pass@k 更重要**
 
 用户不会对客服 Agent 说「你今天失败了，再来一次」。它今天正确退款，明天同样请求却违反 Policy，体验依旧不可接受。对话 Agent 的可靠性要求比一次性成功率更重要，这正是 pass^k 的测量范围。
@@ -321,11 +338,19 @@ tau2-bench 的 DB Grader 工作方式：
 
 Research Agent 的难点在于没有可以直接验证的单一正确答案。什么叫覆盖全面，什么叫分析有深度，专家之间可能产生分歧。
 
-[DeepResearch Bench](https://github.com/Ayanami0730/deep_research_bench) 把这个模糊问题拆成两条独立管线：RACE 测内容质量，FACT 测引用可信度。
+[DeepResearch Bench](https://github.com/Ayanami0730/deep_research_bench) 的应对策略是把"报告好不好"这个模糊问题拆成两个可独立测量的子问题：**内容质量**（RACE）和**引用可信度**（FACT）。一篇报告可以写得很完整但引用全是编的，也可以引用都有来源但内容肤浅——两者必须分别测量。
 
-**RACE：动态 Rubric 的相对评分**
+**任务从哪来：专家设计 + 真实需求驱动**
 
-RACE 的核心 prompt 结构（来自 `prompt/score_prompt_en.py`）：
+Anthropic 原文反复强调 Task 质量决定 Eval 的区分度，Research Agent 领域尤其如此——一个不需要深度研究就能回答的问题，根本测不出 Agent 的能力差异。
+
+DeepResearch Bench 的 100 个任务由 100+ 位 PhD 级研究者和资深从业者（5 年以上经验）设计，横跨 22 个学科领域。选题分布参照了 96,147 条真实用户查询的分析结果，确保任务反映真实需求而非学术空想。每个任务经过质量、清晰度、真实性和挑战度四重人工筛选。
+
+这个投入的回报是：任务本身就具备区分度，不会出现"所有 Agent 都能轻松拿满分"的天花板问题。
+
+**RACE：相对评分 + 动态 Rubric**
+
+RACE 的核心设计是**相对评分**——不对报告做绝对好坏的判断，而是把被测报告和一篇参考报告放在一起，让 LLM Judge 对同一套标准分别打分：
 
 ```
 <task>"{task_prompt}"</task>
@@ -336,15 +361,15 @@ RACE 的核心 prompt 结构（来自 `prompt/score_prompt_en.py`）：
 打分规则：每个 criterion 对 article_1 和 article_2 各打 0-10 分
 ```
 
-最终分数是相对分：`score = article_1_total / (article_1_total + article_2_total)`，0.5 表示与参考报告持平。
+最终得分 = `target_total / (target_total + reference_total)`，0.5 表示与参考报告持平，高于 0.5 表示超越。参考报告是一个固定的质量锚点，让不同 Agent 的分数在同一参照系下可比。
 
 评分标准（criteria）不是固定的，而是按任务动态生成，分三步走：
 
 1. 固定四个评分维度：comprehensiveness、insight、instruction_following、readability
-2. 对每个任务，让 LLM 生成各维度的权重（采样 5 次取平均，然后归一化到总和为 1）
+2. 对每个任务，让 LLM 生成各维度的权重（采样 5 次取平均，归一化到总和为 1）
 3. 对每个维度，生成针对该任务的细粒度评分标准
 
-比如一个关于「中国中产阶层财富现状」的研究任务，它的 comprehensiveness 维度可能包含「各阶层实际收入信息的广度（权重 0.15）」「中产阶层规模与财力估算（权重 0.20）」这样的具体标准，而不是泛泛的「覆盖是否全面」。
+比如一个关于「中国中产阶层财富现状」的研究任务，comprehensiveness 维度下可能包含「各阶层实际收入信息的广度（权重 0.15）」「中产阶层规模与财力估算（权重 0.20）」这样的具体标准，而不是泛泛的「覆盖是否全面」。动态 Rubric 让同一套框架能适配从金融分析到生物医学的不同领域任务。
 
 **FACT：四步管线验证引用可信度**
 
@@ -353,29 +378,29 @@ FACT 管线检查报告里每条引用声明是否真的有来源支撑，完整
 1. **提取**（`utils/extract.py`）：LLM 从报告中识别所有引用实例，提取 (声明, 引用索引, URL) 三元组
 2. **去重**（`utils/deduplicate.py`）：LLM 合并冗余的声明-URL 对，减少后续验证的工作量
 3. **抓取**（`utils/scrape.py`）：通过 Jina API 获取每个 URL 的实际内容
-4. **验证**（`utils/validate.py`）：LLM 逐条判断每条声明是 `supported`（材料中找到依据）、`unsupported`（找不到依据）还是 `unknown`（URL 内容无效，如 404 页面）
+4. **验证**（`utils/validate.py`）：LLM 逐条判断每条声明是 `supported`、`unsupported` 还是 `unknown`（URL 内容无效）
 
-去重步骤值得注意——它体现了一个实用原则：在昂贵的 LLM 逐条验证之前，先用确定性或低成本手段降噪。这和前面 Grader 选择中"能用代码解决的不要交给 LLM"的思路一脉相承。
+去重步骤体现了一个实用原则：在昂贵的 LLM 逐条验证之前，先降噪。这和前面"能用代码解决的不要交给 LLM"的思路一脉相承。
 
-RACE 和 FACT 合在一起解决了一个容易混淆的问题：一篇报告可以写得很完整但引用全是编的，也可以引用都有来源但内容肤浅。质量和可信度需要分别测量。
+**Judge 校准：专家验证评分可信度**
 
-**Judge 校准的具体门槛**
+LLM Judge 的打分只有在与人类判断对齐时才有意义。DeepResearch Bench 在 2026 年 5 月更换 Judge 时，先在 50 个任务 × 4 个模型 = 200 篇文章上做人工标注，得到标注员基准一致率 **68.78%**（即人类评审员之间的一致性），再测试候选 Judge：
 
-DeepResearch Bench 在 2026 年 5 月更换官方 evaluator 时，先在 50 个任务 × 4 个模型 = 200 篇文章上做人工标注，得到人工标注员基准一致率 **68.78%**，再测试候选 Judge 与人类判断的对齐率：
-
-| Judge | Overall |
+| Judge | 与人类判断对齐率 |
 |---|---|
 | GPT-5.5 | **71.82%** |
 | Gemini-3.1-Pro | 70.58% |
 | Claude-Opus-4-7 | 70.11% |
 
-最终选 GPT-5.5。Judge 需要超过人工基准才有意义——如果 Judge 的一致性还不如让两个评审员抛硬币，引入它只会增加不确定性。
+最终选 GPT-5.5。这个选择标准值得注意：Judge 的对齐率需要**超过人类标注员之间的一致率**才有意义——如果 Judge 的一致性还不如两个人类评审员之间的共识水平，引入它只会增加噪声。
 
-另一个重要后果：Grader 模型切换后，同一份报告可能得到不同分数，历史排行榜不再天然可比。DeepResearch Bench 在换 Judge 时维护了分开的版本迁移说明，这是值得借鉴的做法。
+这也带来一个后果：Grader 模型切换后，同一份报告可能得到不同分数，历史排行榜不再天然可比。DeepResearch Bench 在换 Judge 时维护了分开的版本迁移说明，这是值得借鉴的做法。
 
-**Benchmark + Grader Pipeline vs 完整 Harness**
+整体来看，DeepResearch Bench 把专家参与集中在两个影响最大的环节：**任务设计**（决定评什么）和 **Judge 校准**（决定评得准不准）。这和 Anthropic"calibrate with human experts"的建议一致——不是每个环节都需要人工，而是在人类判断力不可替代的地方投入专家。
 
-DeepResearch Bench 要求使用者先在外部运行 Research Agent，再把报告保存为 JSONL，然后运行 RACE 和 FACT。它不负责启动 Agent、提供搜索环境或记录 Research Agent 的完整轨迹。
+**定位与局限**
+
+DeepResearch Bench 要求使用者先在外部运行 Research Agent，再把报告保存为 JSONL（每行一个 JSON 对象，包含任务 ID、原始查询和生成的报告全文），然后运行 RACE 和 FACT。它不负责启动 Agent、提供搜索环境或记录完整轨迹。
 
 所以它更准确的定位是 Benchmark + Grader Pipeline，而不是端到端 Evaluation Harness。这意味着你能评价最终报告的质量，却很难分析 Agent 在哪一步选择了低质量的搜索结果、为什么漏掉关键来源——那些信息需要外层 Harness 记录下来。
 
@@ -415,7 +440,9 @@ OSWorld Task 定义里有一个 `evaluator` 字段，它把「如何采集结果
 }
 ```
 
-`result.type` 决定用哪种 getter 采集状态——`enable_do_not_track` 读取 Chrome Preferences JSON，`history` 查询 SQLite 数据库，`accessibility_tree` 解析 AT-SPI XML，`vm_file` 从 VM 下载文件再与 HuggingFace 上的 gold 文件比对。
+这个结构把三件事解耦了：`func` 决定比对方式（精确匹配、模糊匹配等），`result.type` 决定从哪里采集实际状态，`expected.type` 决定期望值从哪里来（`rule` 表示直接写在配置里，也可以从文件或 HuggingFace 下载 gold 标准）。
+
+`result.type` 决定用哪种 getter（状态采集函数，每种 getter 知道去操作系统的哪个位置、用什么方式读取目标状态）——`enable_do_not_track` 读取 Chrome Preferences JSON，`history` 查询 SQLite 数据库，`accessibility_tree` 解析 AT-SPI（Linux 无障碍接口）XML，`vm_file` 从 VM 下载文件再与 HuggingFace 上的 gold 文件比对。
 
 整个项目定义了近 60 种 getter 类型，分布在 chrome、file、misc、vlc 等十多个模块中，每种对应一类 OS 状态的具体读取方式。这说明了一个根本原则：**Computer Use Agent 的「结果」不是一段文本，而是分散在操作系统各处的状态变更，用通用的字符串匹配来评估文件修改、数据库变更或 UI 状态，必然失真。** 先定义「什么状态是正确结果」，再针对这个状态设计专属的采集逻辑，是更可靠的路径。
 
